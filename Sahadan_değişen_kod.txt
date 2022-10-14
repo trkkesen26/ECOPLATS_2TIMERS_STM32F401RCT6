@@ -1,0 +1,1281 @@
+/* USER CODE BEGIN Header */
+/*
+ * DEBUG NOTES & TODO
+ * - sd kartsız çalışacak bir sistem.
+ * - sd status logger
+ * -
+ */
+#define CHECK_LOGGER_STATUS   0b00000101  // 2^0 = Ethernet, 2^1 = SD Card, 2^2 = Inputs
+#define CHECK_ETH_LOGGER	  0b00000001
+#define CHECK_SD_LOGGER		  0b00000000
+#define CHECK_INPUT_LOGGER	  0b00000100
+
+#define ETHERNET_CHIP		"W5500"
+#define _WIZCHIP_ 			5500
+#define _WIZCHIP_IO_MODE_ 	_WIZCHIP_IO_MODE_SPI
+#define DEBUG_UART
+
+#define DEVICE_ID			"003"
+#define WELLTEC
+
+#define BCD2DEC(v)			((v/16*10) + (v%16))
+#define DEC2BCD(v)			((v/10*16) + (v%10))
+#define HEX2BCD(v)			((v) % 10 + (v) / 10 * 16)
+#define BCD2HEX(v)			((v) % 16 + (v) / 16 * 10)
+
+#define BYTE_TO_BINARY_PATTERN "%c%c%c%c%c%c%c%c"
+#define BYTE_TO_BINARY(byte)  \
+  (byte & 0x80 ? '1' : '0'), \
+  (byte & 0x40 ? '1' : '0'), \
+  (byte & 0x20 ? '1' : '0'), \
+  (byte & 0x10 ? '1' : '0'), \
+  (byte & 0x08 ? '1' : '0'), \
+  (byte & 0x04 ? '1' : '0'), \
+  (byte & 0x02 ? '1' : '0'), \
+  (byte & 0x01 ? '1' : '0')
+
+#define MALLOCK_BUF_SIZE	250
+#define SD_READ_BUF_SIZE	500
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2022 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "fatfs.h"
+#include "rtc.h"
+#include "spi.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "fatfs_sd.h"
+#include "setup.h"
+#include "sntp.h"
+#include "pingRequest.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+SD_CARD_StatusTypeDef sdStatus = SD_CARD_NOT_READY;
+LinkedList_StatusTypeDef listStatus = LIST_NOT_READY;
+ETHERNET_StatusTypeDef ethStatus;
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define CHECK_INPUTS(v) 	   (TIMER3_HERTZ/(v))
+#define CHECK_THERMOCOUPLE(v)  (TIMER3_HERTZ*(v))
+#define CHECK_RTC(v)           (TIMER3_HERTZ*(v))
+#define CHECK_ETHERNET(v)	   (TIMER3_HERTZ*(v))
+
+#define CHECK_LOGGER_TIME	   (TIMER3_HERTZ * 60)
+
+#define YEAR				   2000	// RTC will be set by getting 2 digits, so while printing||sending we need this.Change it when we are in 2100
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+typedef volatile unsigned long long TIMER;
+TIMER timerCounter = 0;
+TIMER timeout;
+TIMER ethStatusCounter = 0;
+TIMER statusLoggerCounter = 0;
+TIMER denemeTimer;
+volatile int currentState;
+/*Inputs Variables */
+volatile uint8_t prevInputs;
+volatile uint8_t currentInputs;
+volatile bool IsInputChanged = false;
+/* Inputs Variables End */
+
+/* Ethernet Status */
+bool IsMachineWorking = false;
+bool IsInitDone = false;
+/* Mqtt Variables */
+uint8_t mqttURL[] = "localhost";
+unsigned char ethBuf0[ETH_MAX_BUF_SIZE];
+unsigned char tempBuffer[1024*2] = {};
+
+/*
+ -username : ithinka
+ -password : 7pnmBHXE2ZQNiqjmj_EW
+ */
+char hostIp[4] = {192, 168, 1, 253};
+struct mqtt_client mqttopt = {
+		  .clientid = "denemeClient",
+		  .nodelimiter = 0,
+		  .delimiter = "\n",
+		  .qos = QOS0,
+		  .username = "ithinka",
+		  .password = "7pnmBHXE2ZQNiqjmj_EW",
+		  .host = hostIp,
+		  .port = 1883,
+		  .showtopics = 1
+};
+/* Mqtt Variables End */
+uint8_t pDestaddr[4]= {192, 168, 1, 253};
+/* NTP SETUP BEGIN */
+uint8_t ntp_server[4] = {162, 159, 200, 123};
+uint8_t ntpSocket = 0;
+uint8_t timeZone = 28;
+unsigned char ethBuf[ETH_MAX_BUF_SIZE];
+uint8_t dns_server_ip[4] = {208, 67, 222, 222};
+uint8_t dnsclient_ip[4];
+/* NTP SETUP END */
+
+/* Thermocouple Variables */
+volatile uint16_t thermoCel = 0;
+volatile bool thermoValueSended = false;
+/* Thermocouple Variables End*/
+
+bool IsheadCreated = false;
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+/* USER CODE BEGIN PFP */
+void checkInputs(void);
+void checkThermoCelcius(void);
+void msgLogger (char*);
+RTC_StatusTypeDef setRTCTime(void);
+char* getRTCStatus(RTC_StatusTypeDef);
+char* getRTCTime(void);
+char* getLogTime(void);
+char* getDataTime(void);
+uint8_t dayOfWeek(uint8_t, uint8_t, uint8_t);
+struct node* allocateMem();
+bool pop(struct node **);
+uint8_t length();
+int MQTT_run(char* sdBuf);
+bool checkSDStore(void);
+RTC_StatusTypeDef RTC_Init(void);
+ETHERNET_StatusTypeDef checkEthernetStatus(void);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+FATFS fs;
+FIL fil;
+FRESULT fresult;
+DIR dir;
+FILINFO fno;
+/*
+ * To store all input data like input name and date, did create 2 structs.
+ */
+struct inputVal {
+	char inputLowDate[TIME_BUFFER_SIZE];
+	char inputHighDate[TIME_BUFFER_SIZE];
+};
+
+struct productVal {
+	enum productInfo pInfo;
+	struct inputVal mouldBackward;
+	struct inputVal injectionForward;
+	struct inputVal rawMaterialPacking;
+	struct inputVal injectionBacward;
+	struct inputVal mouldForward;
+	char productEndDate[TIME_BUFFER_SIZE];
+}*product;
+
+struct node {
+	struct productVal productFinished;
+	struct node *next;
+};
+
+struct node *head = NULL;
+struct node *current = NULL;
+
+bool IsproductCreated = false;
+
+SD_CARD_StatusTypeDef sdStatus;
+RTC_StatusTypeDef status = SET_RTC_NOK;
+ETHERNET_StatusTypeDef ethStatus = ETHERNET_ERR;
+
+bool writeSDProductInfo(struct productVal *product);
+bool writeLinkedListToSD(struct node *head);
+void fillStruct(struct productVal *product);
+void fillnode(struct node *node);
+void push(struct node *head, struct productVal *product);
+
+/*
+ * printf func. must be declared like that. And do not forget to use \r\n end of the string.
+ * It works with buffer and buffer controlled end of string parametter.
+ */
+#if defined(__GNUC__)
+int _write(int fd, char * ptr, int len)
+{
+  HAL_UART_Transmit(&huart1, (uint8_t *) ptr, len, HAL_MAX_DELAY);
+  return len;
+}
+#elif defined (__ICCARM__)
+	#include "LowLevelIOInterface.h"
+	size_t __write(int handle, const unsigned char * buffer, size_t size)
+	{
+	  HAL_UART_Transmit(&huart1, (uint8_t *) buffer, size, HAL_MAX_DELAY);
+	  return size;
+	}
+#elif defined (__CC_ARM)
+	int fputc(int ch, FILE *f)
+	{
+		HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+		return ch;
+	}
+#endif
+
+#ifdef __GNUC__
+	#define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
+#else
+	#define PUTCHAR_PROTOTYPE int fputc(int ch, FILE *f)
+#endif /* __GNUC__ */
+
+PUTCHAR_PROTOTYPE
+{
+  HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+  return ch;
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_RTC_Init();
+  MX_SPI1_Init();
+  MX_SPI2_Init();
+  MX_TIM3_Init();
+  MX_USART1_UART_Init();
+  MX_FATFS_Init();
+  /* USER CODE BEGIN 2 */
+  reg_wizchip_cs_cbfunc(cs_sel, cs_desel);
+  reg_wizchip_spi_cbfunc(spi_rb, spi_wb);
+
+  w5500_setup w5500opt = {
+		  .bufSize = {2,2,2,2,2,2,2,2},
+		  .netInfo = {   .mac 	= {0x00, 0x08, 0xff, 0xab, 0xcd, 0x01},					// Mac address
+  	  	  	  	  	     .ip 	= {192, 168, 1, 11},									// IP address
+						 .sn 	= {255, 255, 0, 0},										// Subnet mask
+						 .gw 	= {192, 168, 1, 254},									// Gateway address
+		  },
+		  .netTimeInfo = {
+					.retry_cnt = 3,		 // 100ms, 200ms, 400ms, 800ms, 1600ms
+					.time_100us = 1000,  // 200ms, 400ms, 800ms, 1600 ms, 3200ms  ==> 6.2 sn
+		  }
+  };
+
+  prevInputs |= (READ_INPUT_MOULD_BACKWARD << MOULD_BACKWARD);
+  prevInputs |= (READ_INPUT_INJECTION_FORWARD << INJECTION_FORWARD);
+  prevInputs |= (READ_INPUT_RAW_MATERIAL_PACKING << RAW_MATERIAL_PACKING);
+  prevInputs |= (READ_INPUT_INJECTION_BACKWARD << INJECTION_FORWARD);
+  prevInputs |= (READ_INPUT_MOULD_FORWARD << MOULD_FORWARD);
+
+  HAL_TIM_Base_Start_IT(&htim3);
+
+  statusLoggerCounter = timerCounter;
+
+  w5500Reset();
+  w5500Init(w5500opt);
+
+  //SNTP_init(ntpSocket, ntp_server, timeZone, ethBuf);
+
+  //RTC_Init();
+
+  //DNS_init(0,ethBuf0);
+
+  checkEthernetStatus();
+
+  /* Setting RTC Block End*/
+
+  /*SD Managing Block Begin */
+  /*
+   * f_mount is must. Without it, can't use sd functions. They only return error.
+   * data directory will be used for product information.
+   * log directory will be used for logging.
+   */
+  fresult = f_mount(&fs, "", 0);
+  if (fresult != FR_OK) {
+	  printf("Error Happaned while mounting SD Card!\r\n");
+	  sdStatus = SD_CARD_ERROR;
+  }
+  else {
+	  printf("f_mount is complated succesfully.\r\n");
+	  sdStatus = SD_CARD_READY;
+  }
+
+  IsInitDone = true;
+  MQTT_run("TESTMSG");
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+	  #if CHECK_LOGGER_STATUS & CHECK_ETH_LOGGER == CHECK_ETH_LOGGER
+		    if (timerCounter - statusLoggerCounter > CHECK_LOGGER_TIME) {
+			    if (ethStatus == ETHERNET_OK) {
+				    msgLogger("Ethernert Status is OK.");
+			    }
+			    else if (ethStatus == ETHERNET_CABLE_ERR) {
+				    msgLogger("Ethernet Cable is Not Connected.");
+			    }
+			    else if (ethStatus == ETHERNET_CON_ERR) {
+				    msgLogger("Can't connect to the server.");
+			    }
+			    else if (ethStatus == ETHERNET_CHIP_ERR) {
+				    msgLogger("W5500 chip could not be found.");
+			    }
+			    statusLoggerCounter = timerCounter;
+		    }
+	  #endif
+
+	  if (ethStatus != ETHERNET_OK && ethStatus != ETHERNET_CABLE_ERR && !IsMachineWorking) {
+		  w5500Reset();
+		  w5500Init(w5500opt);
+		  msgLogger("W5500 ReInit is done!!!.");
+	  }
+
+	  bool sdResult = false;
+	  if (!IsproductCreated) {
+		  product = (struct productVal*)malloc(sizeof(struct productVal));
+		  fillStruct(product);
+		  msgLogger("New Product Object has been created.");
+		  IsproductCreated = true;
+	  }
+	  if (sdStatus == SD_CARD_READY && (timerCounter % 100 == 0) && currentInputs == prevInputs) {
+		  checkSDStore();
+	  }
+	#ifdef ZHAFIR
+	  if (currentInputs != prevInputs) {
+		  #if CHECK_LOGGER_STATUS & CHECK_INPUT_LOGGER == CHECK_INPUT_LOGGER
+			  char buf[500];
+			  sprintf(buf, "currentInputs = "BYTE_TO_BINARY_PATTERN, BYTE_TO_BINARY(currentInputs));
+			  msgLogger(buf);
+		  #endif
+
+		  switch (currentState) {
+		  case 0:
+			  if (currentInputs == 0b00000011) {
+				  prevInputs = currentInputs;
+				  strcpy(product->mouldBackward.inputHighDate, getRTCTime());
+				  currentState = 1;
+				  msgLogger("Current State is changed 0 --> 1.");
+			  }
+			  else {
+				  prevInputs = currentInputs;
+			  }
+			  break;
+		  case 1:
+			  if (currentInputs == 0b00000001) {
+				  prevInputs = currentInputs;
+				  strcpy(product->injectionForward.inputHighDate, getRTCTime());
+				  strcpy(product->mouldBackward.inputLowDate, getRTCTime());
+				  currentState = 2;
+				  msgLogger("Current State is changed 1 --> 2");
+			  }
+			  else {
+				  currentState = 0;
+				  product->pInfo = PRODUCT_NOK;
+				  msgLogger("Current State is 0. There is wrong input information.");
+				  sdResult = writeSDProductInfo(product);
+				  free(product);
+				  IsproductCreated = false;
+				  prevInputs = currentInputs;
+			  }
+			  break;
+		  case 2:
+			  if (currentInputs == 0b00000101) {
+				  strcpy(product->rawMaterialPacking.inputHighDate, getRTCTime());
+				  strcpy(product->injectionForward.inputLowDate, getRTCTime());
+				  currentState = 3;
+				  prevInputs = currentInputs;
+				  msgLogger("Current State is changed 2 --> 3");
+			  }
+			  else {
+				  currentState = 0;
+				  product->pInfo = PRODUCT_NOK;
+				  msgLogger("Current State is 0. There is wrong input information.");
+				  sdResult = writeSDProductInfo(product);
+				  free(product);
+				  IsproductCreated = false;
+				  prevInputs = currentInputs;
+			  }
+			  break;
+		  case 3:
+			  if (currentInputs == 0b00000001) {
+				  strcpy(product->injectionBacward.inputHighDate, getRTCTime());
+				  strcpy(product->rawMaterialPacking.inputLowDate, getRTCTime());
+				  currentState = 4;
+				  prevInputs = currentInputs;
+				  msgLogger("Current State is changed 3 --> 4");
+			  }
+			  else {
+				  currentState = 0;
+				  product->pInfo = PRODUCT_NOK;
+				  msgLogger("Current State is 0. There is wrong input information.");
+				  sdResult = writeSDProductInfo(product);
+				  free(product);
+				  IsproductCreated = false;
+				  prevInputs = currentInputs;
+			  }
+			  break;
+		  case 4:
+			  if (currentInputs == 0b00000000) {
+				  strcpy(product->mouldForward.inputHighDate, getRTCTime());
+				  strcpy(product->injectionBacward.inputLowDate, getRTCTime());
+				  currentState = 5;
+				  prevInputs = currentInputs;
+				  msgLogger("Current State is changed 4 --> 5");
+			  }
+			  else {
+				  currentState = 0;
+				  product->pInfo = PRODUCT_NOK;
+				  msgLogger("Current State is 0. There is wrong input information.");
+				  sdResult = writeSDProductInfo(product);
+				  free(product);
+				  IsproductCreated = false;
+				  prevInputs = currentInputs;
+			  }
+			  break;
+		  case 5:
+			  if (currentInputs == 0b00010000) {
+				strcpy(product->mouldForward.inputLowDate, getRTCTime());
+				msgLogger("Current State is changed 5 --> 6");
+				prevInputs = currentInputs;
+				strcpy(product->productEndDate, getDataTime());
+				product->pInfo = PRODUCT_OK;
+				sdResult = writeSDProductInfo(product);
+				if (sdResult) {
+					currentState = 0;
+					msgLogger("Successfully write data to SD.");
+				}
+				else {
+					msgLogger("Can't write data to SD. Going to write to linkedlist.");
+					currentState = 0;
+				}
+				free(product);
+				IsproductCreated = false;
+			  }
+			  else {
+				  currentState = 0;
+				  product->pInfo = PRODUCT_NOK;
+				  msgLogger("Current State is 0. There is wrong input information.");
+				  sdResult = writeSDProductInfo(product);
+				  free(product);
+				  IsproductCreated = false;
+				  prevInputs = currentInputs;
+			  }
+			  break;
+		  }
+	  }
+	#endif
+
+	#if defined(WELLTEC) || defined(HAITAN)
+	  if (currentInputs != prevInputs) {
+          #if CHECK_LOGGER_STATUS & CHECK_INPUT_LOGGER == CHECK_INPUT_LOGGER
+			char buf[500];
+			sprintf(buf, "currentInputs = "BYTE_TO_BINARY_PATTERN, BYTE_TO_BINARY(currentInputs));
+			msgLogger(buf);
+		  #endif
+
+		  switch (currentState) {
+		  case 0:
+			  if ((currentInputs & (1 << MOULD_BACKWARD)) == (0b00000000 | (1 << MOULD_BACKWARD))) {
+				  prevInputs = currentInputs;
+				  strcpy(product->mouldBackward.inputHighDate, getRTCTime());
+				  currentState = 1;
+				  msgLogger("Current State is changed 0 --> 1.");
+			  }
+			  else {
+				  prevInputs = currentInputs;
+			  }
+			  break;
+		  case 1:
+			  if ((currentInputs & (0 << MOULD_BACKWARD)) == (0b00000000 | currentInputs)) {
+				  prevInputs = currentInputs;
+				  strcpy(product->mouldBackward.inputLowDate, getRTCTime());
+				  currentState = 2;
+				  msgLogger("Current State is changed 1 --> 2.");
+			  }
+			  else {
+				  currentState = 0;
+				  product->pInfo = PRODUCT_NOK;
+				  msgLogger("Current State is 0. There is wrong input information.");
+				  sdResult = writeSDProductInfo(product);
+				  free(product);
+				  IsproductCreated = false;
+				  prevInputs = currentInputs;
+			  }
+			  break;
+		  case 2:
+			  if ((currentInputs & (1 << INJECTION_FORWARD)) == (0b00000000 | (1 << INJECTION_FORWARD))) {
+				  prevInputs = currentInputs;
+				  strcpy(product->injectionForward.inputHighDate, getRTCTime());
+				  currentState = 3;
+				  msgLogger("Current State is changed 2 --> 3");
+			  }
+			  else {
+				  currentState = 0;
+				  product->pInfo = PRODUCT_NOK;
+				  msgLogger("Current State is 0. There is wrong input information.");
+				  sdResult = writeSDProductInfo(product);
+				  free(product);
+				  IsproductCreated = false;
+				  prevInputs = currentInputs;
+			  }
+			  break;
+		  case 3:
+			  if ((currentInputs & (0 << INJECTION_FORWARD)) == (0b00000000 | currentInputs)) {
+				  strcpy(product->injectionForward.inputLowDate, getRTCTime());
+				  currentState = 4;
+				  prevInputs = currentInputs;
+				  msgLogger("Current State is changed 3 --> 4");
+			  }
+			  else {
+				  currentState = 0;
+				  product->pInfo = PRODUCT_NOK;
+				  msgLogger("Current State is 0. There is wrong input information.");
+				  sdResult = writeSDProductInfo(product);
+				  free(product);
+				  IsproductCreated = false;
+				  prevInputs = currentInputs;
+			  }
+			  break;
+		  case 4:
+			  if ((currentInputs & (1 << RAW_MATERIAL_PACKING)) == (0b00000000 | (1 << RAW_MATERIAL_PACKING))) {
+				  strcpy(product->rawMaterialPacking.inputHighDate, getRTCTime());
+				  currentState = 5;
+				  prevInputs = currentInputs;
+				  msgLogger("Current State is changed 4 --> 5");
+			  }
+			  else {
+				  currentState = 0;
+				  product->pInfo = PRODUCT_NOK;
+				  msgLogger("Current State is 0. There is wrong input information.");
+				  sdResult = writeSDProductInfo(product);
+				  free(product);
+				  IsproductCreated = false;
+				  prevInputs = currentInputs;
+			  }
+			  break;
+		  case 5:
+			  if ((currentInputs & (0 << RAW_MATERIAL_PACKING)) == (0b00000000 | currentInputs)) {
+				strcpy(product->rawMaterialPacking.inputLowDate, getRTCTime());
+				currentState = 6;
+				msgLogger("Current State is changed 5 --> 6");
+				prevInputs = currentInputs;
+			  }
+			  else {
+				  currentState = 0;
+				  product->pInfo = PRODUCT_NOK;
+				  msgLogger("Current State is 0. There is wrong input information.");
+				  sdResult = writeSDProductInfo(product);
+				  free(product);
+				  IsproductCreated = false;
+				  prevInputs = currentInputs;
+			  }
+			  break;
+		  case 6:
+			  if ((currentInputs & (1 << MOULD_FORWARD)) == (0b00000000 | (1 << MOULD_FORWARD))) {
+				  strcpy(product->mouldForward.inputHighDate, getRTCTime());
+				  currentState = 7;
+				  msgLogger("Current State is changed 6 --> 7");
+				  prevInputs = currentInputs;
+			  }
+			  else {
+				  currentState = 0;
+				  product->pInfo = PRODUCT_NOK;
+				  msgLogger("Current State is 0. There is wrong input information");
+				  sdResult = writeSDProductInfo(product);
+				  free(product);
+				  IsproductCreated = false;
+				  prevInputs = currentInputs;
+			  }
+			  break;
+		  case 7:
+			  if ((currentInputs & (0 << MOULD_FORWARD)) == (0b00000000 | currentInputs)) {
+				  strcpy(product->mouldForward.inputLowDate, getRTCTime());
+				  strcpy(product->productEndDate, getDataTime());
+				  msgLogger("Current State is changed 7 --> 8");
+				  prevInputs = currentInputs;
+				  product->pInfo = PRODUCT_OK;
+				  sdResult = writeSDProductInfo(product);
+				  if (sdResult) {
+					  currentState = 0;
+					  msgLogger("Successfully write data to SD_CARD.");
+				  }
+				  else {
+					  msgLogger("Data couldn't write to SD_CARD.");
+					  currentState = 0;
+				  }
+				  free(product);
+				  IsproductCreated = false;
+			  }
+			  else {
+				  currentState = 0;
+				  MQTT_run("{\"result\": 0}");
+			  }
+			  break;
+		  }
+	  }
+	#endif
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI|RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSE;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USER CODE BEGIN 4 */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+	/*
+	 * Timer Hertz = 20Hz.
+	 */
+	timerCounter++;
+	if (IsInitDone) {
+		if (timerCounter % CHECK_INPUTS(10) == 0) checkInputs();
+		if (timerCounter % CHECK_THERMOCOUPLE(60) == 0) checkThermoCelcius();
+		//if (timerCounter % CHECK_RTC(3600) == 0) RTC_Init();
+		if (timerCounter - ethStatusCounter > CHECK_ETHERNET(30)) {
+			checkEthernetStatus();
+			ethStatusCounter = timerCounter;
+			IsMachineWorking = false;
+		}
+	}
+}
+
+void checkInputs(void)
+{
+	currentInputs &= 0b00000000;
+	currentInputs |= (READ_INPUT_MOULD_BACKWARD << MOULD_BACKWARD);
+	currentInputs |= (READ_INPUT_INJECTION_FORWARD << INJECTION_FORWARD);
+	currentInputs |= (READ_INPUT_RAW_MATERIAL_PACKING << RAW_MATERIAL_PACKING);
+	currentInputs |= (READ_INPUT_INJECTION_BACKWARD << INJECTION_BACKWARD);
+	currentInputs |= (READ_INPUT_MOULD_FORWARD << MOULD_FORWARD);
+	/*
+	if (currentInputs == 0b00000000) {
+		if ()
+		prevInputs = currentInputs;
+	}
+	*/
+	if (prevInputs != currentInputs) {
+		IsMachineWorking = true;
+		ethStatusCounter = timerCounter;
+	}
+}
+
+void checkThermoCelcius(void)
+{
+	thermoCel &= 0x00;
+	CS_ENABLE;
+	for (int i = 15; i >= 0; i--) {
+		SCK_HIGH;
+		if (READ_DATA_PIN) thermoCel |= (1 << i);
+		SCK_LOW;
+	}
+	CS_DISABLE;
+
+	if (thermoCel & 0x4) {
+		thermoCel &= 0x00;
+		return;
+	}
+	else {
+		thermoCel >>= 3;
+		thermoCel *= 0.25;
+		thermoValueSended = false;
+	}
+	#ifdef DEBUG_UART
+		if (thermoCel & 0xff)
+		printf("Thermo Value is %d\n", thermoCel);
+	#endif
+}
+
+ETHERNET_StatusTypeDef checkEthernetStatus(void)
+{
+	char idBuf[8];
+	ctlwizchip(CW_GET_ID, (uint8_t*)idBuf);
+	if (strcmp(idBuf, ETHERNET_CHIP) == 0) {
+		printf("W5500 Chip is detected. \r\n");
+	}
+	else {
+		printf("Ethernet chip detection ERROR!. \r\n");
+		ethStatus = ETHERNET_CHIP_ERR;
+		return ETHERNET_CHIP_ERR;
+	}
+
+	if (wizphy_getphylink()) {
+		printf("Ethernet Cable is connected. \r\n");
+	}
+	else {
+		printf("Ethernet Cable is NOT connected. \r\n");
+		ethStatus = ETHERNET_CABLE_ERR;
+		return ETHERNET_CABLE_ERR;
+	}
+
+	int tmp = 0;
+	tmp = ping_auto(0,pDestaddr, 1);
+	if (tmp != SUCCESS){
+		printf("Ping connection is NOT OK. \r\n");
+		ethStatus = ETHERNET_CON_ERR;
+		return ETHERNET_CON_ERR;
+	}
+	else {
+		printf("Ping is sent to host succesfully. \r\n");
+	}
+
+	ethStatus = ETHERNET_OK;
+	printf("ETHERNET CONNECTION IS OKAY. \r\n");
+	return ETHERNET_OK;
+}
+
+RTC_StatusTypeDef setRTCTime()  //timeBuf is gonna have ["day" = 0, "month" = 1, "year" = 2, "hour" = 3, "min" = 4, "second" = 5]
+{
+	uint8_t status;
+	datetime ntpTime;
+	status = SNTP_run(&ntpTime);
+	// check rtc.c if there is added new sDate and sTime
+	if (status) {
+		RTC_TimeTypeDef sTime = {0};
+		RTC_DateTypeDef sDate = {0};
+
+		sTime.Hours = DEC2BCD(ntpTime.hh);
+		sTime.Minutes = DEC2BCD(ntpTime.mm);
+		sTime.Seconds = DEC2BCD(ntpTime.ss);
+		sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+		sTime.StoreOperation = RTC_STOREOPERATION_RESET;
+		if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
+		{
+			Error_Handler();
+		}
+		sDate.Date = DEC2BCD(ntpTime.dd);
+		sDate.Month = DEC2BCD(ntpTime.mo);
+		sDate.Year = DEC2BCD(ntpTime.yy%100);
+		sDate.WeekDay = DEC2BCD(dayOfWeek(ntpTime.dd, ntpTime.mo, ntpTime.yy));  // d, m, y
+		if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD) != HAL_OK)
+		{
+			Error_Handler();
+		}
+		return SET_RTC_OK;
+	}
+	else return SET_RTC_NOK;
+}
+
+char* getRTCTime(void)
+{
+	RTC_TimeTypeDef gTime;
+	RTC_DateTypeDef gDate;
+
+	static char getTimeBuf[30] = {'\0'};
+
+	HAL_RTC_GetTime(&hrtc, &gTime, RTC_FORMAT_BCD);
+	HAL_RTC_GetDate(&hrtc, &gDate, RTC_FORMAT_BCD);
+
+	sprintf(getTimeBuf, "%02d/%02d/%04d,%02d:%02d:%02d", BCD2DEC(gDate.Date), BCD2DEC(gDate.Month), BCD2DEC(gDate.Year) + YEAR, BCD2DEC(gTime.Hours), BCD2DEC(gTime.Minutes), BCD2DEC(gTime.Seconds));
+						//format can be changed by what developers want.
+	return getTimeBuf;
+}
+
+char* getLogTime(void)
+{
+	RTC_TimeTypeDef gTime;
+	RTC_DateTypeDef gDate;
+
+	static char getTimeBuf[30] = {'\0'};
+
+	HAL_RTC_GetTime(&hrtc, &gTime, RTC_FORMAT_BCD);
+	HAL_RTC_GetDate(&hrtc, &gDate, RTC_FORMAT_BCD);
+
+	sprintf(getTimeBuf,"%02d_%02d_%04d", BCD2DEC(gDate.Date), BCD2DEC(gDate.Month), BCD2DEC(gDate.Year) + YEAR);
+						//format can be changed by what developers want.
+	return getTimeBuf;
+}
+
+char* getDataTime(void)
+{
+	RTC_TimeTypeDef gTime;
+	RTC_DateTypeDef gDate;
+
+	static char getTimeBuf[30] = {'\0'};
+
+	HAL_RTC_GetTime(&hrtc, &gTime, RTC_FORMAT_BCD);
+	HAL_RTC_GetDate(&hrtc, &gDate, RTC_FORMAT_BCD);
+
+	sprintf(getTimeBuf, "%02d_%02d_%04dT%02d_%02d_%02d", BCD2DEC(gDate.Date), BCD2DEC(gDate.Month), BCD2DEC(gDate.Year) + YEAR, BCD2DEC(gTime.Hours), BCD2DEC(gTime.Minutes), BCD2DEC(gTime.Seconds));
+						//format can be changed by what developers want.
+	return getTimeBuf;
+}
+
+uint8_t dayOfWeek(uint8_t d, uint8_t m, uint8_t y)
+{
+	//this is zero-based algorithm. So sunday is 0 monday is 1 etc.
+	uint8_t weekDay = (d += m < 3 ? y-- : y - 2, 23*m/9 + d + 4 + y/4- y/100 + y/400)%7;
+	if (weekDay == 0) return 7;
+	else return weekDay;
+}
+
+void msgLogger (char* msg)
+{
+#if DEBUG != 0
+	uint32_t len = strlen(msg);
+	printf("[%s] ==> %s\n", getRTCTime(), msg);
+	if (len > 2000) return;
+	#if SD_LOG != 0
+		char *ptrBuf = (char*)malloc(len * sizeof(char));
+		if (ptrBuf == NULL) {
+			printf("[%s] ==> %s\n", getRTCTime(), "Can't allocate memory for debug");
+			return;
+		}
+		if (sdStatus == SD_CARD_READY) {
+			sdStatus = SD_CARD_BUSY;
+		    fresult = f_mkdir("Logs");
+		    if (fresult == FR_EXIST) {
+		    	printf("LOG File is already exited.\n");
+		    }
+		    else if (fresult != FR_OK) {
+		    	printf("Error Happaned while opening Dictionary! Fresult = %d\n", fresult);
+		    	free(ptrBuf);
+		    	return;
+		    }
+		  	else {
+		  		printf("Log directory is created.\n");
+		  	}
+			char fileName[40];
+			sprintf(fileName, "Logs/%s.log", getLogTime());
+			fresult = f_open(&fil, fileName, FA_OPEN_APPEND | FA_WRITE);
+			if (fresult == FR_OK) {
+				sprintf(ptrBuf, "%s ==> %s\n", getRTCTime(), msg);
+				f_puts(ptrBuf, &fil);
+				f_close(&fil);
+			}
+			free(ptrBuf);
+		}
+		else {
+			free(ptrBuf);
+		}
+		sdStatus = SD_CARD_READY;
+	#endif
+#endif
+}
+
+
+bool writeSDProductInfo(struct productVal *product)
+{
+	char *result = (char*)malloc(4 * (sizeof(int)));
+	if (result == NULL) {
+		printf("[writeSDProductInfo()] Memory Allocation Error!!!");
+		return false;
+	}
+	char *mback  = (char*)malloc(MALLOCK_BUF_SIZE * (sizeof(char)));
+	if (mback == NULL) {
+		printf("[writeSDProductInfo()] Memory Allocation Error!!!");
+		free(result);
+		return false;
+	}
+	char *mforw  = (char*)malloc(MALLOCK_BUF_SIZE * (sizeof(char)));
+	if (mforw == NULL) {
+		printf("[writeSDProductInfo()] Memory Allocation Error!!!");
+		free(result); free(mback);
+		return false;
+	}
+	char *iback  = (char*)malloc(MALLOCK_BUF_SIZE * (sizeof(char)));
+	if (iback == NULL) {
+		printf("[writeSDProductInfo()] Memory Allocation Error!!!");
+		free(result); free(mback); free(mforw);
+		return false;
+	}
+	char *iforw  = (char*)malloc(MALLOCK_BUF_SIZE * (sizeof(char)));
+	if (iforw == NULL) {
+		printf("[writeSDProductInfo()] Memory Allocation Error!!!");
+		free(result); free(mback); free(mforw); free(iback);
+		return false;
+	}
+	char *rmet   = (char*)malloc(MALLOCK_BUF_SIZE * (sizeof(char)));
+	if (rmet == NULL) {
+		printf("[writeSDProductInfo()] Memory Allocation Error!!!");
+		free(result); free(mback); free(mforw); free(iback); free(iforw);
+		return false;
+	}
+
+	if (sdStatus == SD_CARD_READY) {
+		sdStatus = SD_CARD_BUSY;
+		fresult = f_mkdir(DATA_STORE_DIR_NAME);
+		if (fresult == FR_EXIST) printf("DATA File is already exited.\n");
+		else if (fresult != FR_OK) printf("Error Happaned while opening Dictionary! Fresult = %d\n", fresult);
+		else printf("Data directory is created.\n");
+		char fileName[40];
+		if (strlen(product->productEndDate) > 5) {
+			sprintf(fileName, "Data/%s.log", product->productEndDate);
+		} else {
+			sprintf(fileName, "Data/%s_Err.log", getLogTime());
+		}
+		fresult = f_open(&fil, fileName, FA_OPEN_ALWAYS | FA_WRITE);
+		if (fresult == FR_OK) {
+			sprintf(result, "\"result\": %d", product->pInfo);
+			sprintf(mback, ", \"mback\": { \"inputHighDate\": \"%s\", \"inputLowDate\": \"%s\" }", product->mouldBackward.inputHighDate, product->mouldBackward.inputLowDate);
+			sprintf(mforw, ", \"mforw\": { \"inputHighDate\": \"%s\", \"inputLowDate\": \"%s\" }", product->mouldForward.inputHighDate, product->mouldForward.inputLowDate);
+			sprintf(iback, ", \"iback\": { \"inputHighDate\": \"%s\", \"inputLowDate\": \"%s\" }", product->injectionBacward.inputHighDate, product->injectionBacward.inputLowDate);
+			sprintf(iforw, ", \"iforw\": { \"inputHighDate\": \"%s\", \"inputLowDate\": \"%s\" }", product->injectionForward.inputHighDate, product->injectionForward.inputLowDate);
+			sprintf(rmet, ", \"rmet\": { \"inputHighDate\": \"%s\", \"inputLowDate\": \"%s\" }", product->rawMaterialPacking.inputHighDate, product->rawMaterialPacking.inputLowDate);
+			char* data = (char*)malloc(MALLOCK_BUF_SIZE* 5 * (sizeof(char)));
+			if (data != NULL) {
+				sprintf(data, "{%s%s%s%s%s%s}", result, mback, mforw, iback, iforw, rmet);
+				f_puts(data, &fil);
+				free(result); free(mback); free(mforw); free(iback); free(iforw);
+				free(data);
+				f_close(&fil);
+				sdStatus = SD_CARD_READY;
+				return true;
+			}
+			else {
+				free(result); free(mback); free(mforw); free(iback); free(iforw);
+				printf("[writeSDProductInfo()] Memory Allocation Error. \r\n");
+				f_close(&fil);
+				sdStatus = SD_CARD_READY;
+				return false;
+			}
+		}
+		else {
+			free(result); free(mback); free(mforw); free(iback); free(iforw);
+			printf("[writeSDProductInfo()] Error happaned while opening file.\r\n");
+			sdStatus = SD_CARD_READY;
+			return false;
+		}
+	}
+	else {
+		free(result); free(mback); free(mforw); free(iback); free(iforw);
+		return false;
+	}
+
+	return false;
+}
+
+void fillStruct(struct productVal *product)
+{
+	product->pInfo = PRODUCT_NOK;
+	sprintf(product->injectionBacward.inputHighDate, "null");
+	sprintf(product->injectionBacward.inputLowDate, "null");
+	sprintf(product->injectionForward.inputHighDate, "null");
+	sprintf(product->injectionForward.inputLowDate, "null");
+	sprintf(product->mouldBackward.inputHighDate, "null");
+	sprintf(product->mouldBackward.inputLowDate, "null");
+	sprintf(product->mouldForward.inputHighDate, "null");
+	sprintf(product->mouldForward.inputLowDate, "null");
+	sprintf(product->rawMaterialPacking.inputHighDate, "null");
+	sprintf(product->rawMaterialPacking.inputLowDate, "null");
+	sprintf(product->productEndDate, "null");
+}
+
+/* Linked-List Functions Begin*/
+/*****************************************
+struct node* allocateMem()
+{
+    struct node *struct1 = malloc(sizeof(struct node));
+    return struct1;
+}
+void fillnode(struct node *node)
+{
+	head->next = NULL;
+	sprintf(head->productFinished.injectionBacward.inputHighDate, "null");
+	sprintf(head->productFinished.injectionBacward.inputLowDate, "null");
+	sprintf(head->productFinished.injectionForward.inputHighDate, "null");
+	sprintf(head->productFinished.injectionForward.inputLowDate, "null");
+	sprintf(head->productFinished.mouldBackward.inputHighDate, "null");
+	sprintf(head->productFinished.mouldBackward.inputLowDate, "null");
+	sprintf(head->productFinished.mouldForward.inputHighDate, "null");
+	sprintf(head->productFinished.mouldForward.inputLowDate, "null");
+	sprintf(head->productFinished.rawMaterialPacking.inputHighDate, "null");
+	sprintf(head->productFinished.rawMaterialPacking.inputLowDate, "null");
+	sprintf(head->productFinished.productEndDate, "null");
+	head->productFinished.pInfo = PRODUCT_NOK;
+}
+void push(struct node *head, struct productVal *product) {
+	  //To add item end of the linkedlist.
+    struct node *current = head;
+    while (current->next != NULL) {
+        current = current->next;
+    }
+    current->next = (struct node*) malloc(sizeof(struct node));
+    strcpy(current->next->productFinished.injectionBacward.inputHighDate, product->injectionBacward.inputHighDate);
+    strcpy(current->next->productFinished.injectionBacward.inputLowDate, product->injectionBacward.inputLowDate);
+    strcpy(current->next->productFinished.injectionForward.inputHighDate, product->injectionForward.inputHighDate);
+    strcpy(current->next->productFinished.injectionForward.inputLowDate, product->injectionForward.inputLowDate);
+    strcpy(current->next->productFinished.mouldBackward.inputHighDate, product->mouldBackward.inputHighDate);
+    strcpy(current->next->productFinished.mouldBackward.inputLowDate, product->mouldBackward.inputLowDate);
+    strcpy(current->next->productFinished.mouldForward.inputHighDate, product->mouldForward.inputHighDate);
+    strcpy(current->next->productFinished.mouldForward.inputLowDate, product->mouldForward.inputLowDate);
+    strcpy(current->next->productFinished.rawMaterialPacking.inputHighDate, product->rawMaterialPacking.inputHighDate);
+    strcpy(current->next->productFinished.rawMaterialPacking.inputLowDate, product->rawMaterialPacking.inputLowDate);
+    strcpy(current->next->productFinished.productEndDate, product->productEndDate);
+    current->next->productFinished.pInfo = product->pInfo;
+    current->next->next = NULL;
+}
+bool pop(struct node ** head) {
+//delete first item
+    struct node * next_node = NULL;
+    if (*head == NULL) {
+        return 0;
+    }
+    next_node = (*head)->next;
+    free(*head);
+    *head = next_node;
+    return 1;
+}
+uint8_t length()
+{
+   uint8_t length = 0;
+   struct node *current;
+   for(current = head; current != NULL; current = current->next) {
+      length++;
+   }
+   return length;
+}
+**********************************/
+bool checkSDStore(void)
+{
+	sdStatus = SD_CARD_BUSY;
+	fresult = f_findfirst(&dir, &fno, "Data", "????*.log");
+	if (strlen(fno.fname) > 1 && fresult == FR_OK) {
+		char fileName[sizeof(fno.fname) + 20];
+		sprintf(fileName, "Data/%s", fno.fname);
+		fresult = f_open(&fil, fileName, FA_READ);
+		char buf[SD_READ_BUF_SIZE];
+		f_gets(buf, sizeof(buf), &fil);
+		int result = MQTT_run(buf);
+		if (result < 0) {
+			msgLogger("Error Happaned While Sending Data to MQTT Server.");
+			sdStatus = SD_CARD_READY;
+			fresult = f_close(&fil);
+			return false;
+		}
+		else {
+			msgLogger("Data has been sent succesfully.");
+			fresult = f_close(&fil);
+			f_unlink(fileName);
+		}
+	}
+	sdStatus = SD_CARD_READY;
+	return true;
+}
+
+bool writeLinkedListToSD(struct node *head)
+{
+	return true;
+}
+
+int MQTT_run(char* sdBuf)
+{
+	int rc = 0;
+	uint8_t buf[SD_READ_BUF_SIZE];
+	char pubbuf[SD_READ_BUF_SIZE];
+	Network n;
+	MQTTClient c;
+	MQTTMessage m;
+
+	NewNetwork(&n, 0);
+	int i =	ConnectNetwork(&n, (uint8_t*)hostIp, 1883);
+	if (i == 0) return -1;
+	MQTTClientInit(&c, &n, 1000, buf, sizeof(buf), tempBuffer, sizeof(tempBuffer));
+
+	MQTTPacket_connectData data = MQTTPacket_connectData_initializer;
+	data.willFlag = 0;
+	data.MQTTVersion = 3;
+	data.clientID.cstring = mqttopt.clientid;
+	data.username.cstring = mqttopt.username;
+	data.password.cstring = mqttopt.password;
+
+	data.keepAliveInterval = 60;
+	data.cleansession = 1;
+
+	rc = MQTTConnect(&c, &data);
+	if (rc < 0) {
+		return rc;
+	}
+	printf("Connected to server : {%d, %d, %d, %d}\r\n", hostIp[0], hostIp[1], hostIp[2], hostIp[3]);
+	mqttopt.showtopics = 1;
+
+	m.qos = QOS0;
+	m.retained = 1;
+	m.dup = 0;
+
+	MQTTYield(&c, data.keepAliveInterval);
+	sprintf(pubbuf, sdBuf);
+	m.payload = pubbuf;
+	m.payloadlen = strlen(pubbuf);
+	uint8_t mqttTOPIC[30] = "/product_003";
+	rc = -1;
+	uint8_t retry = 0;
+	while (rc != 0) {
+		retry++;
+		rc = MQTTPublish(&c, (const char*)mqttTOPIC, &m);
+		if (retry > 4) return rc;
+	}
+	printf("Message is sent to MQTT Server.\r\n");
+	return rc;
+}
+
+/* Linked-List Functions End */
+
+/* ENUM TO Char* Functions */
+char* getRTCStatus(RTC_StatusTypeDef status)
+{
+	switch(status)
+	{
+		case -1:
+			return "SET_RTC_NOK";
+		case 1:
+			return "SET_RTC_OK";
+		case -2:
+			return "GET_RTC_NOK";
+		case 2:
+			return "GET_RTC_OK";
+		default:
+			return "NOTHING";
+	}
+	return "NOTHING";
+}
+
+RTC_StatusTypeDef RTC_Init(void)
+{
+  timeout = timerCounter;
+  TIMER delay = timerCounter;
+  while (SET_RTC_OK != status && timeout + RTC_SET_TIMEOUT(5) > timerCounter) {
+	  /*
+	   * I think delay is must. Without delay ntp can't return a value of time.
+	   * With delay It can be.
+	   * In debug mod it doesn't happend because in debug mod mcu works slow.
+	   */
+	  status = setRTCTime();
+	  while ((delay + TIMER3_HERTZ * 2) > timerCounter) __NOP();  //10 is equal to half of sec.
+	  if (status == SET_RTC_OK) printf("setRTCTime() OK!\r\n");
+	  else {
+		  delay = timerCounter;
+	  }
+  }
+  if (SET_RTC_OK == status) {
+	  printf("Time is succesfully set to = %s, status = %s \r\n", getRTCTime(), getRTCStatus(status));
+  }
+  else {
+	  printf("RTC INIT ERROR = %s\r\n", getRTCStatus(status));
+  }
+
+  return status;
+}
+/* ENUM TO Char* Functions End*/
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
