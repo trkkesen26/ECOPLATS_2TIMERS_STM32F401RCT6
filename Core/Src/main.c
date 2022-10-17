@@ -46,6 +46,7 @@
 #include "Application/loopback/loopback.h"
 #include "Ethernet/W5500/w5500.h"
 #include "Internet/MQTT/MQTTClient.h"
+#include <time.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -80,7 +81,7 @@ w5500_setup w5500opt = {
  -username : ithinka
  -password : 7pnmBHXE2ZQNiqjmj_EW
  */
-char hostIp[4] = {192, 168, 1, 14};
+char hostIp[4] = {192, 168, 1, 47};
 unsigned char tempBuffer[1024*2] = {};
 
 struct mqtt_client mqttopt = {
@@ -145,7 +146,7 @@ void spi_wb(uint8_t b);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-uint8_t ntp_server[4] = {216, 239, 35, 4};
+uint8_t ntp_server[4] = {176, 235, 22, 135};
 uint8_t ntpSocket = 0;
 uint8_t timeZone = 28;
 unsigned char ethBuf[ETH_MAX_BUF_SIZE];
@@ -297,14 +298,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 		else if (currentTimer4Status == 2) {
 			if (w5500Init(w5500opt) == 0) {
 				msgLogger("W5500 init OK.");
-				if (rtcStatus == SET_RTC_NOK) {
-					currentTimer4Status = 3;
-					msgLogger("Timer4 status is changed. 2 --> 3");
-				}
-				else {
-					currentTimer4Status = 4;
-					msgLogger("Timer4 status is changed. 2 --> 4");
-				}
+				currentTimer4Status = 3;
+				msgLogger("Timer4 status is changed. 2 --> 3");
 			}
 			else {
 				currentTimer4Status = 0;
@@ -312,48 +307,58 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 			}
 		}
 		else if (currentTimer4Status == 3) {
+			currentTimer4Status = 4;
+			msgLogger("Timer4 status is changed. 3 --> 4");
+		}
+		else if (currentTimer4Status == 4) {
+			currentTimer4Status = 5;
+			msgLogger("Timer4 status is changed. 4 --> 5");
+		}
+		else if (currentTimer4Status == 5) {
 			static int counter = 0;
-			if (timer4Counter % 2 == 0) {    //to make 2 seconds delay
-				SNTP_init(ntpSocket, ntp_server, timeZone, ethBuf);
-				if (SET_RTC_OK == setRTCTime()) {
-					rtcStatus = SET_RTC_OK;
-					printf("Time is succesfully set to = %s\r\n", getRTCTime());
-					currentTimer4Status = 4;
-					msgLogger("Timer4 status is changed. 3 --> 4");
-					counter = 0;
-				}
-				else {
-					msgLogger("setRTCTime Error");
-					counter++;
-					if (counter > 10) {
-						msgLogger("setRTCTime Error happaned too many times.");
+			if (rtcStatus == SET_RTC_NOK) {
+				if (timer4Counter % 2 == 0) {    //to make 2 seconds delay
+					SNTP_init(ntpSocket, ntp_server, timeZone, ethBuf);
+					if (SET_RTC_OK == setRTCTime()) {
+						rtcStatus = SET_RTC_OK;
+						printf("Time is succesfully set to = %s\r\n", getRTCTime());
+						currentTimer4Status = 6;
+						msgLogger("Timer4 status is changed. 5 --> 6");
 						counter = 0;
-						currentTimer4Status = 0;
-						msgLogger("Timer4 status is changed. 3 --> 0");
+					}
+					else {
+						msgLogger("setRTCTime Error");
+						counter++;
+						if (counter > 10) {
+							msgLogger("setRTCTime Error happaned too many times.");
+							counter = 0;
+							currentTimer4Status = 0;
+							msgLogger("Timer4 status is changed. 5 --> 0");
+						}
 					}
 				}
 			}
 		}
-		else if (currentTimer4Status == 4) {
+		else if (currentTimer4Status == 6) {
 			if (IsProductDone) {
-				currentTimer4Status = 5;
-				msgLogger("Timer4 status is changed. 4 --> 5");
+				currentTimer4Status = 7;
+				msgLogger("Timer4 status is changed. 6 --> 7");
 			}
 		}
-		else if (currentTimer4Status == 5) {
+		else if (currentTimer4Status == 7) {
 			if (sdStatus == SD_CARD_READY) {
 				if (checkSDStore()) {
-					currentTimer4Status = 4;
-					msgLogger("Timer4 status is changed. 5 --> 4");
+					currentTimer4Status = 6;
+					msgLogger("Timer4 status is changed. 7 --> 6");
 				}
 				else {
 					currentTimer4Status = 0;
-					msgLogger("Timer4 status is changed. 5 --> 0");
+					msgLogger("Timer4 status is changed. 7 --> 0");
 				}
 			}
 			if (!IsProductDone) {
-				currentTimer4Status = 4;
-				msgLogger("Timer4 status is changed. 5 --> 4");
+				currentTimer4Status = 6;
+				msgLogger("Timer4 status is changed. 7 --> 6");
 			}
 		}
 	}
