@@ -1,4 +1,5 @@
 /* USER CODE BEGIN Header */
+#define JULIAN_DATE_BASE     2440588
 /*
  * TODO LIST FOR DEVELOPT
  * - Thermocouple values will need to be included.
@@ -6,6 +7,22 @@
  * - Timer2 ==> Handle w5500 & connection status. Then get data from sd card and send to rabbitmq.
  *
  */
+
+/*
+w5500_setup w5500opt = {
+		  .bufSize = {2,2,2,2,2,2,2,2},
+		  .netInfo = {   .mac 	= {0x00, 0x08, 0xff, 0xab, 0xcd, 0x01},					// Mac address
+	  	  	  	  	     .ip 	= {192, 167, 1, 11},									// IP address
+						 .sn 	= {255, 255, 0, 0},										// Subnet mask
+						 .gw 	= {192, 167, 1, 254},									// Gateway address+
+		  },
+		  .netTimeInfo = {
+					.retry_cnt = 3,		 // 100ms, 200ms, 400ms, 800ms, 1600ms
+					.time_100us = 1000,  // 200ms, 400ms, 800ms, 1600 ms, 3200ms  ==> 6.2 sn
+		  }
+};
+*/
+
 /**
   ******************************************************************************
   * @file           : main.c
@@ -40,6 +57,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "Internet/SNTP/sntp.h"
 #include "Ethernet/wizchip_conf.h"
 #include "Ethernet/socket.h"
@@ -47,6 +65,7 @@
 #include "Ethernet/W5500/w5500.h"
 #include "Internet/MQTT/MQTTClient.h"
 #include <time.h>
+#include <inttypes.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -67,9 +86,9 @@ FILINFO fno;
 w5500_setup w5500opt = {
 		  .bufSize = {2,2,2,2,2,2,2,2},
 		  .netInfo = {   .mac 	= {0x00, 0x08, 0xff, 0xab, 0xcd, 0x01},					// Mac address
-	  	  	  	  	     .ip 	= {192, 168, 1, 200},									// IP address
-						 .sn 	= {255, 255, 255, 0},										// Subnet mask
-						 .gw 	= {192, 168, 1, 1},									// Gateway address
+	  	  	  	  	     .ip 	= {192, 168, 1, 133},									// IP address
+						 .sn 	= {255, 255, 255, 0},									// Subnet mask
+						 .gw 	= {192, 168, 1, 1},										// Gateway address+
 		  },
 		  .netTimeInfo = {
 					.retry_cnt = 3,		 // 100ms, 200ms, 400ms, 800ms, 1600ms
@@ -81,7 +100,11 @@ w5500_setup w5500opt = {
  -username : ithinka
  -password : 7pnmBHXE2ZQNiqjmj_EW
  */
-char hostIp[4] = {192, 168, 1, 47};
+
+const uint8_t deviceId = 1;
+
+char hostIp[4] = {192, 167, 1, 253};
+
 unsigned char tempBuffer[1024*2] = {};
 
 struct mqtt_client mqttopt = {
@@ -89,8 +112,8 @@ struct mqtt_client mqttopt = {
 		  .nodelimiter = 0,
 		  .delimiter = "\n",
 		  .qos = QOS0,
-		  .username = "stm32",
-		  .password = "stm32",
+		  .username = "ithinka",
+		  .password = "7pnmBHXE2ZQNiqjmj_EW",
 		  .host = hostIp,
 		  .port = 1883,
 		  .showtopics = 1
@@ -131,6 +154,8 @@ char* getRTCTime(void);
 char* getLogTime(void);
 char* getDataTime(void);
 char* getRTCStatus(RTC_StatusTypeDef status);
+char* getSubsecondTime(void);
+uint32_t getUnixTime(void);
 void fillProduct(struct productVal *product);
 bool writeSDProductInfo(struct productVal *product);
 SD_CARD_StatusTypeDef SDInit(void);
@@ -142,13 +167,15 @@ void cs_sel();
 void cs_desel();
 uint8_t spi_rb(void);
 void spi_wb(uint8_t b);
+void rtc_write_backup_reg(uint32_t BackupRegister, uint32_t data);
+uint32_t rtc_read_backup_reg(uint32_t BackupRegister);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 uint8_t ntp_server[4] = {176, 235, 22, 135};
 uint8_t ntpSocket = 0;
-uint8_t timeZone = 28;
+uint8_t timeZone = 21;
 unsigned char ethBuf[ETH_MAX_BUF_SIZE];
 /* USER CODE END 0 */
 
@@ -322,6 +349,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 					if (SET_RTC_OK == setRTCTime()) {
 						rtcStatus = SET_RTC_OK;
 						printf("Time is succesfully set to = %s\r\n", getRTCTime());
+						printf("UnixTime = %"PRIu32"\r\n", getUnixTime());
 						currentTimer4Status = 6;
 						msgLogger("Timer4 status is changed. 5 --> 6");
 						counter = 0;
@@ -330,13 +358,26 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 						msgLogger("setRTCTime Error");
 						counter++;
 						if (counter > 10) {
-							msgLogger("setRTCTime Error happaned too many times.");
-							counter = 0;
-							currentTimer4Status = 0;
-							msgLogger("Timer4 status is changed. 5 --> 0");
+							if (HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR1) != 0x32F2) {
+								msgLogger("setRTCTime Error happaned too many times.");
+								counter = 0;
+								currentTimer4Status = 0;
+								msgLogger("Timer4 status is changed. 5 --> 0");
+							}
+							else {
+								msgLogger("Going to use RTC Backup Value.");
+								printf("Time is succesfully set to = %s\r\n", getRTCTime());
+								printf("UnixTime = %"PRIu32"\r\n", getUnixTime());
+								currentTimer4Status = 6;
+								msgLogger("Timer4 status is changed. 5 --> 6");
+							}
 						}
 					}
 				}
+			}
+			else {
+				currentTimer4Status = 6;
+				msgLogger("Timer4 status is changed. 5 --> 6");
 			}
 		}
 		else if (currentTimer4Status == 6) {
@@ -366,6 +407,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
 void checkInputs(void)
 {
+	/*
+	 * GPIOB->IDR is input register of port B.
+	 * It returns all of input status, but we only get 0-7.
+	 */
 	currentInputs = GPIOB->IDR;
 	if (prevInputs != currentInputs) {
 		inputStatusLogger(currentInputs);
@@ -378,37 +423,34 @@ int checkProduct(void)
 	switch(currentProductStatus) {
 	case 0:
 		if (((currentInputs & bit(MOULD_BACKWARD)) == bit(MOULD_BACKWARD)) == true) {
-			strcpy(product->mouldBackward.inputHighDate, getRTCTime());
+			sprintf(product->mouldBackward.inputHighDate, "%"PRIu32"%s", getUnixTime(), getSubsecondTime());
 			currentProductStatus = 1;
 			msgLogger("Current product status is changed. 0 --> 1");
 		}
 		break;
 	case 1:
 		if (((currentInputs & bit(MOULD_BACKWARD)) == bit(MOULD_BACKWARD)) == false) {
-			strcpy(product->mouldBackward.inputLowDate, getRTCTime());
+			sprintf(product->mouldBackward.inputLowDate, "%"PRIu32"%s", getUnixTime(), getSubsecondTime());
 			currentProductStatus = 2;
 			msgLogger("Current product status is changed. 1 --> 2");
 		}
 		else {
 			if (((currentInputs & bit(MOULD_FORWARD)) == bit(MOULD_FORWARD)) == true) {
-				strcpy(product->productEndDate, getDataTime());
 				currentProductStatus = 0;
 				msgLogger("Current state is 0. Unexpected behavior has been detected.");
-				product->pInfo = PRODUCT_ERROR;
 				return 1;
 			}
 		}
 		break;
 	case 2:
 		if (((currentInputs & bit(INJECTION_FORWARD)) == bit(INJECTION_FORWARD)) == true) {
-			strcpy(product->injectionForward.inputHighDate, getRTCTime());
+			sprintf(product->injectionForward.inputHighDate, "%"PRIu32"%s", getUnixTime(), getSubsecondTime());
 			currentProductStatus = 3;
 			msgLogger("Current product status is changed. 2 --> 3");
 		}
 		else {
 			if (((currentInputs & bit(MOULD_FORWARD)) == bit(MOULD_FORWARD)) == true) {
-				strcpy(product->productEndDate, getDataTime());
-				product->pInfo = PRODUCT_ERROR;
+				product->productEndDate = getUnixTime();
 				currentProductStatus = 0;
 				msgLogger("Current state is 0. Unexpected behavior has been detected.");
 				return 2;
@@ -417,14 +459,13 @@ int checkProduct(void)
 		break;
 	case 3:
 		if (((currentInputs & bit(INJECTION_FORWARD)) == bit(INJECTION_FORWARD)) == false) {
-			strcpy(product->injectionForward.inputLowDate, getRTCTime());
+			sprintf(product->injectionForward.inputLowDate, "%"PRIu32"%s", getUnixTime(), getSubsecondTime());
 			currentProductStatus = 4;
 			msgLogger("Current product status is changed. 3 --> 4");
 		}
 		else {
 			if (((currentInputs & bit(MOULD_FORWARD)) == bit(MOULD_FORWARD)) == true) {
-				strcpy(product->productEndDate, getDataTime());
-				product->pInfo = PRODUCT_ERROR;
+				product->productEndDate = getUnixTime();
 				currentProductStatus = 0;
 				msgLogger("Current state is 0. Unexpected behavior has been detected.");
 				return 3;
@@ -433,15 +474,14 @@ int checkProduct(void)
 		break;
 	case 4:
 		if (((currentInputs & bit(RAW_MATERIAL_PACKING)) == bit(RAW_MATERIAL_PACKING)) == true) {
-			strcpy(product->rawMaterialPacking.inputHighDate, getRTCTime());
+			sprintf(product->rawMaterialPacking.inputHighDate, "%"PRIu32"%s", getUnixTime(), getSubsecondTime());
 			currentProductStatus = 5;
 			msgLogger("Current product status is changed. 4 --> 5");
 			IsProductDone = false;
 		}
 		else {
 			if (((currentInputs & bit(MOULD_FORWARD)) == bit(MOULD_FORWARD)) == true) {
-				strcpy(product->productEndDate, getDataTime());
-				product->pInfo = PRODUCT_ERROR;
+				product->productEndDate = getUnixTime();
 				currentProductStatus = 0;
 				msgLogger("Current state is 0. Unexpected behavior happaned.");
 				return 4;
@@ -450,14 +490,13 @@ int checkProduct(void)
 		break;
 	case 5:
 		if (((currentInputs & bit(RAW_MATERIAL_PACKING)) == bit(RAW_MATERIAL_PACKING)) == false) {
-			strcpy(product->rawMaterialPacking.inputLowDate, getRTCTime());
+			sprintf(product->rawMaterialPacking.inputLowDate, "%"PRIu32"%s", getUnixTime(), getSubsecondTime());
 			currentProductStatus = 6;
 			msgLogger("Current product status is changed. 5 --> 6");
 		}
 		else {
 			if (((currentInputs & bit(MOULD_FORWARD)) == bit(MOULD_FORWARD)) == true) {
-				strcpy(product->productEndDate, getDataTime());
-				product->pInfo = PRODUCT_ERROR;
+				product->productEndDate = getUnixTime();
 				currentProductStatus = 0;
 				msgLogger("Current state is 0. Unexpected behavior has been detected.");
 				return 5;
@@ -466,14 +505,13 @@ int checkProduct(void)
 		break;
 	case 6:
 		if (((currentInputs & bit(MOULD_FORWARD)) == bit(MOULD_FORWARD)) == true) {
-			strcpy(product->mouldForward.inputHighDate, getRTCTime());
+			sprintf(product->mouldForward.inputHighDate, "%"PRIu32"%s", getUnixTime(), getSubsecondTime());
 			currentProductStatus = 7;
 			msgLogger("Current product status is changed. 6 --> 7");
 		}
 		else {
 			if (((currentInputs & bit(MOULD_BACKWARD)) == bit(MOULD_BACKWARD)) == true) {
-				strcpy(product->productEndDate, getDataTime());
-				product->pInfo = PRODUCT_ERROR;
+			    product->productEndDate = getUnixTime();
 				currentProductStatus = 0;
 				msgLogger("Current state is 0. Unexpected behavior has been detected.");
 				return 6;
@@ -482,9 +520,8 @@ int checkProduct(void)
 		break;
 	case 7:
 		if (((currentInputs & bit(MOULD_FORWARD)) == bit(MOULD_FORWARD)) == false) {
-			strcpy(product->mouldForward.inputLowDate, getRTCTime());
-			strcpy(product->productEndDate, getDataTime());
-			product->pInfo = PRODUCT_PRODUCED;
+			sprintf(product->mouldForward.inputLowDate, "%"PRIu32"%s", getUnixTime(), getSubsecondTime());
+			product->productEndDate = getUnixTime();
 			currentProductStatus = 0;
 			msgLogger("Product produced succesfully.");
 			int sdResult = writeSDProductInfo(product);
@@ -494,8 +531,7 @@ int checkProduct(void)
 		}
 		else {
 			if (((currentInputs & bit(MOULD_BACKWARD)) == bit(MOULD_BACKWARD)) == true) {
-				strcpy(product->productEndDate, getDataTime());
-				product->pInfo = PRODUCT_ERROR;
+				product->productEndDate = getUnixTime();
 				currentProductStatus = 0;
 				msgLogger("Current state is 0. Unexpected behavior has been detected.");
 				return 7;
@@ -508,7 +544,6 @@ int checkProduct(void)
 
 void fillProduct(struct productVal *product)
 {
-	product->pInfo = PRODUCT_ERROR;
 	strcpy(product->injectionForward.inputHighDate, "null");
 	strcpy(product->injectionForward.inputLowDate, "null");
 	strcpy(product->mouldBackward.inputHighDate, "null");
@@ -517,68 +552,45 @@ void fillProduct(struct productVal *product)
 	strcpy(product->mouldForward.inputLowDate, "null");
 	strcpy(product->rawMaterialPacking.inputHighDate, "null");
 	strcpy(product->rawMaterialPacking.inputLowDate, "null");
-	strcpy(product->productEndDate, "null");
+	product->productEndDate = 0;
 }
 
 bool writeSDProductInfo(struct productVal *product)
 {
-	char *result = (char*)malloc(4 * (sizeof(int)));
-	if (result == NULL) {
-		printf("[writeSDProductInfo()] Memory Allocation Error!!!");
-		return false;
-	}
-	char *mback  = (char*)malloc(150 * (sizeof(char)));
-	if (mback == NULL) {
-		printf("[writeSDProductInfo()] Memory Allocation Error!!!");
-		free(result);
-		return false;
-	}
-	char *mforw  = (char*)malloc(150 * (sizeof(char)));
-	if (mforw == NULL) {
-		printf("[writeSDProductInfo()] Memory Allocation Error!!!");
-		free(result); free(mback);
-		return false;
-	}
-	char *iforw  = (char*)malloc(150 * (sizeof(char)));
-	if (iforw == NULL) {
-		printf("[writeSDProductInfo()] Memory Allocation Error!!!");
-		free(result); free(mback); free(mforw);
-		return false;
-	}
-	char *rmet   = (char*)malloc(150 * (sizeof(char)));
-	if (rmet == NULL) {
-		printf("[writeSDProductInfo()] Memory Allocation Error!!!");
-		free(result); free(mback); free(mforw); free(iforw);
-		return false;
-	}
+	/*
+	 * To calculate realCycleTime = TimeDouble(MouldBackward-HighSignal) - TimeDouble(MouldForward-LowSignal)
+	 * To calculate coolingTime = TimeDouble(RawMaterial-HighSignal) - TimeDouble(MouldForward-HighSignal)
+	 * To calculate injectionTime = TimeDouble(Injection-HighSignal) - TimeDouble(RawMaterial-HighSignal)
+	 * Get these signals difference to calculate.
+	 * Temperature signal will be added when it is OK. Now it is static defined to make a data look like DTO.
+	 */
+	char *eptr;
+	double realCycleTime = strtod(product->mouldForward.inputLowDate, &eptr) - strtod(product->mouldBackward.inputHighDate, &eptr);
+	double coolingTime = strtod(product->mouldForward.inputHighDate, &eptr) - strtod(product->rawMaterialPacking.inputHighDate, &eptr);
+	double injectionTime = strtod(product->rawMaterialPacking.inputHighDate, &eptr) - strtod(product->injectionForward.inputHighDate, &eptr);
+	double temperature1 = 0.1;
 
 	if (sdStatus == SD_CARD_READY) {
 		sdStatus = SD_CARD_BUSY;
 		char fileName[50];
-		if (strlen(product->productEndDate) > 5) {
-			sprintf(fileName, "Data/%s.log", product->productEndDate);
+		if (product->productEndDate > 0) {
+			sprintf(fileName, "Data/%"PRIu32".log", product->productEndDate);
 		} else {
-			sprintf(fileName, "Data/%s_Err.log", getLogTime());
+			sprintf(fileName, "Data/%s_Err.log", getDataTime());
 		}
 		fresult = f_open(&fil, fileName, FA_OPEN_ALWAYS | FA_WRITE);
 		if (fresult == FR_OK) {
-			sprintf(result, "\"result\": %d", product->pInfo);
-			sprintf(mback, ", \"mback\": { \"inputHighDate\": \"%s\", \"inputLowDate\": \"%s\" }", product->mouldBackward.inputHighDate, product->mouldBackward.inputLowDate);
-			sprintf(mforw, ", \"mforw\": { \"inputHighDate\": \"%s\", \"inputLowDate\": \"%s\" }", product->mouldForward.inputHighDate, product->mouldForward.inputLowDate);
-			sprintf(iforw, ", \"iforw\": { \"inputHighDate\": \"%s\", \"inputLowDate\": \"%s\" }", product->injectionForward.inputHighDate, product->injectionForward.inputLowDate);
-			sprintf(rmet, ", \"rmet\": { \"inputHighDate\": \"%s\", \"inputLowDate\": \"%s\" }", product->rawMaterialPacking.inputHighDate, product->rawMaterialPacking.inputLowDate);
-			char* data = (char*)malloc(150 * 5 * (sizeof(char)));
+			char* data = (char*)malloc(500 * (sizeof(char)));
 			if (data != NULL) {
-				sprintf(data, "{%s%s%s%s%s}", result, mback, mforw, iforw, rmet);
+				sprintf(data, "{\"deviceId\": %d, \"productDate\":%"PRIu32", \"realCycleTime\": %.3f, \"coolingTime\": %.3f, \"injectionTime\": %.3f, \"temperature\": %.3f}"
+						, deviceId, product->productEndDate, realCycleTime, coolingTime, injectionTime, temperature1);
 				f_puts(data, &fil);
-				free(result); free(mback); free(mforw); free(iforw); free(rmet);
 				free(data);
 				f_close(&fil);
 				sdStatus = SD_CARD_READY;
 				return true;
 			}
 			else {
-				free(result); free(mback); free(mforw); free(iforw); free(rmet);
 				printf("[writeSDProductInfo()] Memory Allocation Error. \r\n");
 				f_close(&fil);
 				sdStatus = SD_CARD_READY;
@@ -586,18 +598,30 @@ bool writeSDProductInfo(struct productVal *product)
 			}
 		}
 		else {
-			free(result); free(mback); free(mforw); free(iforw); free(rmet);
 			printf("[writeSDProductInfo()] Error happaned while opening file.\r\n");
 			sdStatus = SD_CARD_READY;
 			return false;
 		}
 	}
 	else {
-		free(result); free(mback); free(mforw); free(iforw); free(rmet);
 		return false;
 	}
 
 	return false;
+}
+
+uint32_t rtc_read_backup_reg(uint32_t BackupRegister) {
+    RTC_HandleTypeDef RtcHandle;
+    RtcHandle.Instance = RTC;
+    return HAL_RTCEx_BKUPRead(&RtcHandle, BackupRegister);
+}
+
+void rtc_write_backup_reg(uint32_t BackupRegister, uint32_t data) {
+    RTC_HandleTypeDef RtcHandle;
+    RtcHandle.Instance = RTC;
+    HAL_PWR_EnableBkUpAccess();
+    HAL_RTCEx_BKUPWrite(&RtcHandle, BackupRegister, data);
+    HAL_PWR_DisableBkUpAccess();
 }
 
 RTC_StatusTypeDef setRTCTime()  //timeBuf is gonna have ["day" = 0, "month" = 1, "year" = 2, "hour" = 3, "min" = 4, "second" = 5]
@@ -605,10 +629,13 @@ RTC_StatusTypeDef setRTCTime()  //timeBuf is gonna have ["day" = 0, "month" = 1,
 	uint8_t status;
 	datetime ntpTime;
 	status = SNTP_run(&ntpTime);
-	// check rtc.c if there is added new sDate and sTime
 	if (status) {
 		RTC_TimeTypeDef sTime = {0};
 		RTC_DateTypeDef sDate = {0};
+
+		HAL_PWR_EnableBkUpAccess();
+		__HAL_RCC_RTC_CONFIG(RTC_BKP_DR1);
+		__HAL_RCC_RTC_ENABLE();
 
 		sTime.Hours = DEC2BCD(ntpTime.hh);
 		sTime.Minutes = DEC2BCD(ntpTime.mm);
@@ -627,6 +654,7 @@ RTC_StatusTypeDef setRTCTime()  //timeBuf is gonna have ["day" = 0, "month" = 1,
 		{
 			Error_Handler();
 		}
+		HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, 0x32F2);
 		return SET_RTC_OK;
 	}
 	else return SET_RTC_NOK;
@@ -642,9 +670,24 @@ char* getRTCTime(void)
 	HAL_RTC_GetTime(&hrtc, &gTime, RTC_FORMAT_BCD);
 	HAL_RTC_GetDate(&hrtc, &gDate, RTC_FORMAT_BCD);
 
-	sprintf(getTimeBuf, "%02d/%02d/%04d,%02d:%02d:%02d", BCD2DEC(gDate.Date), BCD2DEC(gDate.Month), BCD2DEC(gDate.Year) + YEAR, BCD2DEC(gTime.Hours), BCD2DEC(gTime.Minutes), BCD2DEC(gTime.Seconds));
+	sprintf(getTimeBuf, "%02d/%02d/%04d,%02d:%02d:%02d.%"PRIu32"", BCD2DEC(gDate.Date), BCD2DEC(gDate.Month), BCD2DEC(gDate.Year) + YEAR, BCD2DEC(gTime.Hours), BCD2DEC(gTime.Minutes), BCD2DEC(gTime.Seconds), BCD2DEC(gTime.SubSeconds));
 						//format can be changed by what developers want.
 	return getTimeBuf;
+}
+
+char* getSubsecondTime(void)
+{
+	RTC_TimeTypeDef gTime;
+	RTC_DateTypeDef gDate;
+
+	static char getSubsecondBuf[5] = {'\0'};
+
+	HAL_RTC_GetTime(&hrtc, &gTime, RTC_FORMAT_BCD);
+	HAL_RTC_GetDate(&hrtc, &gDate, RTC_FORMAT_BCD);
+
+	sprintf(getSubsecondBuf, ".%"PRIu32"", BCD2DEC(gTime.SubSeconds));
+
+	return getSubsecondBuf;
 }
 
 char* getLogTime(void)
@@ -701,6 +744,43 @@ char* getRTCStatus(RTC_StatusTypeDef status)
 			return "NOTHING";
 	}
 	return "NOTHING";
+}
+
+uint32_t getUnixTime(void)
+{
+	RTC_TimeTypeDef gTime;
+	RTC_DateTypeDef gDate;
+
+	HAL_RTC_GetTime(&hrtc, &gTime, RTC_FORMAT_BCD);
+	HAL_RTC_GetDate(&hrtc, &gDate, RTC_FORMAT_BCD);
+
+	uint8_t  a;
+	uint16_t y;
+	uint8_t  m;
+	uint32_t JDN;
+
+	// These hardcore math's are taken from http://en.wikipedia.org/wiki/Julian_day
+
+	// Calculate some coefficients
+	a = (14 - BCD2DEC(gDate.Month)) / 12;
+	y = (BCD2DEC(gDate.Year) + 2000) + 4800 - a; // years since 1 March, 4801 BC
+	m = BCD2DEC(gDate.Month) + (12 * a) - 3; // since 1 March, 4801 BC
+
+	// Gregorian calendar date compute
+    JDN  = BCD2DEC(gDate.Date);
+    JDN += (153 * m + 2) / 5;
+    JDN += 365 * y;
+    JDN += y / 4;
+    JDN += -y / 100;
+    JDN += y / 400;
+    JDN  = JDN - 32045;
+    JDN  = JDN - JULIAN_DATE_BASE;    		 // Calculate from base date
+    JDN *= 86400;                     		// Days to seconds
+    JDN += BCD2DEC(gTime.Hours) * 3600;    // ... and today seconds
+    JDN += BCD2DEC(gTime.Minutes) * 60;
+    JDN += BCD2DEC(gTime.Seconds);
+
+	return JDN;
 }
 
 SD_CARD_StatusTypeDef SDInit(void)
@@ -855,7 +935,7 @@ void msgLogger (char* msg)
 void inputStatusLogger(uint8_t input)
 {
 	#if MSG_LOGGER & UART_LOGGER
-		char buf[sizeof("Current Inputs ==> ") + sizeof(int)];
+		char buf[sizeof("Current Inputs ==> ") + sizeof(BYTE_TO_BINARY_PATTERN) + sizeof(int)];
 		sprintf(buf, "Current Inputs ==> "BYTE_TO_BINARY_PATTERN, BYTE_TO_BINARY(input));
 		msgLogger(buf);
 	#endif

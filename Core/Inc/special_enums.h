@@ -8,11 +8,6 @@
 #ifndef INC_SPECIAL_ENUMS_H_
 #define INC_SPECIAL_ENUMS_H_
 
-enum productInfo {
-	PRODUCT_ERROR,
-	PRODUCT_PRODUCED
-};
-
 typedef enum
 {
 	SET_RTC_NOK = -1,

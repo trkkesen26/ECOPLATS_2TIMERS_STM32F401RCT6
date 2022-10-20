@@ -14,17 +14,16 @@
 #include "Internet/MQTT/MQTTClient.h"
 
 struct inputVal {
-	char inputLowDate[PRODUCT_TIME_ARR_SIZE];
-	char inputHighDate[PRODUCT_TIME_ARR_SIZE];
+	char inputLowDate[30];
+	char inputHighDate[30];
 };
 
 struct productVal {
-	enum productInfo pInfo;
 	struct inputVal mouldBackward;
 	struct inputVal injectionForward;
 	struct inputVal rawMaterialPacking;
 	struct inputVal mouldForward;
-	char productEndDate[PRODUCT_TIME_ARR_SIZE];
+	uint32_t productEndDate;
 }*product;
 
 typedef struct w5500_setup
